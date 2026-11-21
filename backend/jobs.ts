@@ -137,9 +137,13 @@ async function report(e: Entry): Promise<void> {
   // failed / cancelled / blocked
   const reason = job.error || 'Unknown error';
   const cancelled = /cancel/i.test(reason);
+  const blocked = /Verification Failed/i.test(reason);
+  const hint = blocked
+    ? `\n\n💡 Tip: abhi sirf kuch chapters fetch nahi ho paaye (temporary). Kripya <b>kuch der baad dobara</b> try karein - jo chapters ban chuke hain wo cache me hain, isliye agli baar tez hoga. Agar phir bhi fail ho to <b>Web+</b> ya <b>Web</b> engine select karke ya chhoti range (jaise 1-100) se try karein.`
+    : `\n\nKripya kuch der baad dobara try karein.`;
   const text = cancelled
     ? `🛑 <b>${title}</b> cancel kar diya gaya.`
-    : `❌ <b>${title}</b> download fail hua.\n<code>${escapeXml(reason.slice(0, 600))}</code>\n\nKripya kuch der baad dobara try karein.`;
+    : `❌ <b>${title}</b> download fail hua.\n<code>${escapeXml(reason.slice(0, 600))}</code>${hint}`;
   if (job.chatId && job.telegramMessageId) {
     await tg.editTelegramMessage(config.botToken, job.chatId, job.telegramMessageId, text).catch(() => notify(e, text));
   } else {

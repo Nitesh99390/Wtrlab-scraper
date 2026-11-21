@@ -768,16 +768,34 @@
         const isHindi = job.language === 'hi';
         const docTitle = isHindi ? `${job.title} [Hindi Edition]` : job.title;
 
-        const gate = await this.verifyAndRepairBuiltChapters({
-          job,
-          builtChapters: chapters,
-          platformName: 'WTR-Lab',
-          matchedSlug: canonicalSlug,
-          jobServiceMode,
-          targetLang: isHindi ? 'hi' : 'en',
-          isWtrlab: true,
-          isFanmtl: false,
-        });
+        const runGate = () =>
+          this.verifyAndRepairBuiltChapters({
+            job,
+            builtChapters: chapters,
+            platformName: 'WTR-Lab',
+            matchedSlug: canonicalSlug,
+            jobServiceMode,
+            targetLang: isHindi ? 'hi' : 'en',
+            isWtrlab: true,
+            isFanmtl: false,
+          });
+        let gate = await runGate();
+
+        // A single transient Jina / network hiccup must never sink a whole 500+ chapter build:
+        // re-run the (idempotent) repair gate up to 2 more times, only for the chapters that are still failing.
+        for (let extraPass = 1; extraPass <= 2 && !gate.passedAll && gate.failedDetails.length > 0 && !this.cancelled.has(job.id); extraPass++) {
+          this.pushJobLog(
+            job,
+            'retry',
+            'verify',
+            `Gate still failing for ${gate.failedDetails.length} chapter(s) [${gate.failedDetails.slice(0, 8).map((f) => f.ch).join(', ')}] — extra repair pass ${extraPass}/2 after cool-down...`
+          );
+          await new Promise((r) => setTimeout(r, 4000 * extraPass));
+          for (const f of gate.failedDetails) {
+            jinaKnown404Until.delete(`https://wtr-lab.com/en/novel/${cleanNovelId}/${canonicalSlug}/chapter-${f.ch}`);
+          }
+          gate = await runGate();
+        }
 
         const finalEndChapter = chapters.length > 0 ? chapters[chapters.length - 1].num : job.totalChapters;
         job.filename = buildSafeNovelFilename(job.title, isHindi ? '_Hindi' : '', job.startChapter, finalEndChapter, isTxt);

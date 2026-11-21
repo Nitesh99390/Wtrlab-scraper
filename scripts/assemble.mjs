@@ -92,6 +92,7 @@ ${telegramCommands}
     createHost: (prefs: { language: Lang; mode: ServiceMode; format: Format }) => new WtrlabHost(prefs),
     getCrawlerStatusPayload,
     wtrlabDynamicNovels,
+    internals: { parseWtrlabChapterMarkdown, probeWtrlabChapterSsrState, normalizeWtrlabSlotTitle },
     catalogSize: () => wtrlabDynamicNovels.size,
   };
 }

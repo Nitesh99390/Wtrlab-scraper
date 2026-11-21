@@ -534,10 +534,24 @@
 
     const head = md.slice(0, 900);
     // NOTE: Only true 404 responses mark is404; Jina 422 selector timeouts are treated as unloaded shells so valid slow chapters retry!
+    // BUGFIX: the page <title> of a perfectly valid chapter is "<Novel> Chapter 404" (also 1404, 2404, 4040 ...).
+    // The old `Title:.*404` test flagged those as HTTP-404 and the whole novel build was blocked. We now strip every
+    // "Chapter/Ch./Episode/#<number>" phrase from the title line BEFORE looking for a 404 marker.
+    const titleLineRaw = (head.match(/^Title:[ \t]*(.*)$/im)?.[1] || '').trim();
+    const titleLineNoChapterNo = titleLineRaw.replace(/(?:chapter|ch\.?|episode|ep\.?|#)\s*\d+/gi, ' ');
+    // A real error page is tiny; a real chapter has a long body. A "404"-looking title next to a long body is NOT a 404
+    // (e.g. a novel literally titled "Room 404" or "Page Not Found").
+    const bodyAfterMarker = md.includes('Markdown Content:') ? md.slice(md.indexOf('Markdown Content:') + 17) : md;
+    const bodyIsSubstantial = bodyAfterMarker.trim().length >= 600;
+    const titleLooksLike404 =
+      !bodyIsSubstantial &&
+      (/(?:^|[\s|:\-–—])404(?:$|[\s|:\-–—!.])/.test(titleLineNoChapterNo) ||
+        /page\s+not\s+found/i.test(titleLineNoChapterNo) ||
+        /^(?:error\s*)?404$/i.test(titleLineNoChapterNo.trim()));
     const is404 =
       md.includes('Warning: Target URL returned error 404') ||
       /\b404\b[\s:-]*page not found/i.test(head) ||
-      /^Title:\s*.*(?:404|Page Not Found)/im.test(head) ||
+      titleLooksLike404 ||
       /^#{1,3}\s*404\s*$/m.test(head);
     if (is404) {
       return { extracted: null, is404: true, isAiGated: false, isAdHijacked: false, isUnloadedShell: false };
@@ -591,8 +605,8 @@
     let titleConfirmsChapterNo = false;
     if (pageTitle) {
       const pageChapMatch =
-        pageTitle.match(/(?:chapter|ch\.?)\s*(\d+)\s*$/i) ||
-        pageTitle.match(/(?:chapter|ch\.?)\s*(\d+)/i);
+        pageTitle.match(/\b(?:chapter|ch\.?)\s*(\d+)\s*$/i) ||
+        pageTitle.match(/\b(?:chapter|ch\.?)\s*(\d+)/i);
       if (pageChapMatch) {
         if (parseInt(pageChapMatch[1], 10) !== chapterNo) {
           return { extracted: null, is404: false, isAiGated: false, isAdHijacked: false, isUnloadedShell: false };
@@ -602,7 +616,7 @@
       if (expectedNovelTitle && !/^WTR-Lab/i.test(expectedNovelTitle)) {
         const strippedTitle = pageTitle
           .replace(/\s*[-|–—]\s*wtr-?lab.*$/i, '')
-          .replace(/\s*(?:chapter|ch\.?)\s*\d+.*$/i, '')
+          .replace(/\s*\b(?:chapter|ch\.?)\s*\d+.*$/i, '')
           .replace(/\s*#\d+.*$/i, '')
           .trim();
         if (
