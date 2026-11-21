@@ -449,17 +449,21 @@
             return null;
           }
 
-          // HTTP 404 or HTTP 422 (Jina returns 422 when WTR-Lab chapter does not exist / selector never exists on 404 page)
-          if (res.status === 404 || res.status === 422) {
+          if (res.status === 404) {
+            markJinaUrl404(targetUrl);
+            return null;
+          }
+
+          // IMPORTANT: Jina returns HTTP 422 when X-Wait-For-Selector timed out on slow CSR hydration OR on a missing chapter.
+          // NEVER mark 422 as a permanent 404 here — let probeWtrlabChapterSsrState() authoritatively check __NEXT_DATA__!
+          if (res.status === 422) {
             let bodyTxt = '';
             try { bodyTxt = await res.text(); } catch {}
-            if (res.status === 404 || bodyTxt.includes('404') || bodyTxt.includes('Page Not Found') || attempt >= 1) {
+            if (bodyTxt.includes('Warning: Target URL returned error 404')) {
               markJinaUrl404(targetUrl);
               return null;
             }
-            // Single fast retry for 422 in case of transient browser timeout on a valid chapter
-            await new Promise((r) => setTimeout(r, 600));
-            continue;
+            return null;
           }
 
           if (res.status >= 500) {
@@ -1605,7 +1609,7 @@
         priority: 'high',
       });
 
-      if (scraped && scraped.paragraphs.length >= 2) {
+      if (scraped && scraped.paragraphs.length >= 1) {
         const processed = await processChapterByServiceMode({
           title: scraped.title,
           paragraphs: scraped.paragraphs,
@@ -1708,7 +1712,7 @@
           paragraphs: extractedParagraphs.map((p: any) => String(p || '').trim()).filter(Boolean),
           source: 'Provided App Chapter',
         }
-      : cached && cached.paragraphs.length >= 2
+      : cached && cached.paragraphs.length >= 1
       ? { title: cached.title, paragraphs: cached.paragraphs, source: 'App Cache' }
       : null;
 
@@ -1723,7 +1727,7 @@
       : await fetchWtrlabLiveChapterViaJina(cleanId, effectiveSlug, numCh, liveModeUsed, effectiveTitle, jinaPriority);
 
     let liveChapter: { title: string; paragraphs: string[]; source: string } | null = null;
-    if (wtrLiveRaw && wtrLiveRaw.paragraphs.length >= 2) {
+    if (wtrLiveRaw && wtrLiveRaw.paragraphs.length >= 1) {
       const snapOrLiveMode = snapshotHit ? snapshotHit.mode : liveModeUsed;
       const processedLive = await processChapterByServiceMode({
         title: wtrLiveRaw.title,

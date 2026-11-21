@@ -35,32 +35,72 @@
       } = params;
       const stats = this.ensureBuildStats(job);
       job.status = 'verifying';
-      const totalRequested = Math.max(1, job.totalChapters - job.startChapter + 1);
 
       // Ensure real canonical slug is resolved so repair/verification never triggers WTR-Lab slug-redirect chapter shifts!
       const canonicalSlug = isWtrlab
         ? await ensureCanonicalWtrlabSlug(String(job.novelId), matchedSlug)
         : matchedSlug;
 
+      const byNum = new Map<number, (typeof builtChapters)[number]>();
+      for (const ch of builtChapters) byNum.set(ch.num, ch);
+
+      // Trim any trailing non-existent chapters at the very end if novel chapter_count was overestimated on WTR-Lab
+      if (isWtrlab && job.totalChapters > job.startChapter) {
+        while (job.totalChapters > job.startChapter) {
+          const tailCh = byNum.get(job.totalChapters);
+          if (!tailCh || (!tailCh.isOmittedFallback && !this.isPlaceholderChapter(tailCh.paragraphs))) {
+            break;
+          }
+          const probe = await probeWtrlabChapterSsrState(String(job.novelId), canonicalSlug, job.totalChapters, 'high');
+          if (probe.confirmedMissing || !probe.exists) {
+            byNum.delete(job.totalChapters);
+            const idxInArr = builtChapters.findIndex((x) => x.num === job.totalChapters);
+            if (idxInArr >= 0) builtChapters.splice(idxInArr, 1);
+            if (stats.placeholderCount > 0) stats.placeholderCount -= 1;
+            this.pushJobLog(job, 'warn', 'verify', `Trimmed non-existent trailing Ch ${job.totalChapters} (confirmed absent on WTR-Lab).`, job.totalChapters);
+            job.totalChapters -= 1;
+          } else {
+            break;
+          }
+        }
+      }
+
+      const totalRequested = Math.max(1, job.totalChapters - job.startChapter + 1);
+      stats.totalRequested = totalRequested;
+
       this.pushJobLog(
         job,
         'info',
         'verify',
-        `Post-Build Verification Gate started: auditing ALL ${builtChapters.length}/${totalRequested} chapter(s) before delivery...`
+        `Post-Build Zero-Gap Verification Gate: auditing ALL ${totalRequested} chapter slot(s) (${job.startChapter}–${job.totalChapters})...`
       );
       if (job.chatId && job.botToken && job.telegramMessageId) {
         await editTelegramMessage(
           job.botToken,
           job.chatId,
           job.telegramMessageId,
-          `🔍 <b>Verifying All ${builtChapters.length} Chapters...</b>\n` +
+          `🔍 <b>Verifying All ${totalRequested} Chapters (${job.startChapter}–${job.totalChapters})...</b>\n` +
             `📖 <b>${escapeXml(job.title)}</b>\n` +
-            `Checking sequence, zero-duplicates, &amp; live ${escapeXml(platformName)} parity.`
+            `Checking zero-gaps, zero-duplicates, &amp; live ${escapeXml(platformName)} parity.`
         ).catch(() => {});
       }
 
-      const byNum = new Map<number, (typeof builtChapters)[number]>();
-      for (const ch of builtChapters) byNum.set(ch.num, ch);
+      // Guarantee every single chapter slot in [startChapter..totalChapters] exists in builtChapters (zero middle gaps!)
+      for (let expectedCh = job.startChapter; expectedCh <= job.totalChapters; expectedCh++) {
+        if (!byNum.has(expectedCh)) {
+          const missingSlot = {
+            num: expectedCh,
+            title: `Chapter ${expectedCh}`,
+            paragraphs: [`[Chapter ${expectedCh} queued for recovery]`],
+            url: `https://wtr-lab.com/en/novel/${job.novelId}/${canonicalSlug}/chapter-${expectedCh}`,
+            isOmittedFallback: true,
+          };
+          builtChapters.push(missingSlot);
+          byNum.set(expectedCh, missingSlot);
+          stats.placeholderCount += 1;
+        }
+      }
+      builtChapters.sort((a, b) => a.num - b.num);
 
       const seenFullHashes = new Map<string, number>();
       const seenOpeningKeys = new Map<string, number>();
@@ -89,7 +129,7 @@
       // Pass 1: Concurrent Parity & Intra-Chapter Cleanup Check
       type SlotPreCheck = {
         expectedCh: number;
-        ch?: (typeof builtChapters)[number];
+        ch: (typeof builtChapters)[number];
         checkTitle: string;
         checkParas: string[];
         isPlaceholder: boolean;
@@ -111,25 +151,8 @@
             if (this.cancelled.has(job.id)) return;
             const expectedCh = nextAuditCh++;
             const idx = expectedCh - job.startChapter;
-            const ch = byNum.get(expectedCh);
-            if (!ch) {
-              slotPreChecks[idx] = {
-                expectedCh,
-                checkTitle: '',
-                checkParas: [],
-                isPlaceholder: true,
-                headingOk: false,
-                fullHash: '',
-                openingKey: '',
-                secondKey: '',
-                normTitle: '',
-                isNumberedTitle: false,
-                wtrVerdict: null,
-              };
-              continue;
-            }
+            const ch = byNum.get(expectedCh)!;
 
-            // Guarantee intra-chapter paragraph deduplication
             ch.paragraphs = deduplicateChapterParagraphs(ch.paragraphs);
             if (Array.isArray(ch.sourceEnParagraphs)) {
               ch.sourceEnParagraphs = deduplicateChapterParagraphs(ch.sourceEnParagraphs);
@@ -145,7 +168,8 @@
             const isPlaceholder =
               Boolean(ch.isOmittedFallback) ||
               this.isPlaceholderChapter(ch.paragraphs) ||
-              this.isPlaceholderChapter(checkParas);
+              this.isPlaceholderChapter(checkParas) ||
+              checkParas.length === 0;
             const headingOk = chapterHeadingMatchesRequested(checkTitle, expectedCh, true);
             const fp = computeChapterFingerprint(checkParas);
             const normTitle = checkTitle.toLowerCase().replace(/\s+/g, ' ').trim();
@@ -198,16 +222,8 @@
       for (let idx = 0; idx < slotPreChecks.length; idx++) {
         if (this.cancelled.has(job.id)) break;
         const slot = slotPreChecks[idx];
-        const expectedCh = slot ? slot.expectedCh : job.startChapter + idx;
-        const ch = slot?.ch;
-
-        if (!ch || !slot) {
-          missingCount++;
-          const msg = `Chapter slot missing from built novel (expected Ch ${expectedCh})`;
-          failedDetails.push({ ch: expectedCh, reason: msg });
-          this.pushJobLog(job, 'error', 'verify', msg, expectedCh);
-          continue;
-        }
+        if (!slot) continue;
+        const { expectedCh, ch } = slot;
 
         const dupPartner =
           (slot.fullHash ? seenFullHashes.get(slot.fullHash) : undefined) ||
@@ -275,7 +291,7 @@
         else exactCount++;
       }
 
-      // Pass 2B: Concurrent Repair Pool using Canonical Slug & Clean Scraper
+      // Pass 2B: Multi-Attempt Deep Repair Pool (4 escalating attempts + SSR author-gap / locked-chapter handling)
       if (flaggedTasks.length > 0 && !this.cancelled.has(job.id)) {
         let cursor = 0;
         const workers = Math.min(3, flaggedTasks.length);
@@ -289,14 +305,33 @@
               this.pushJobLog(job, 'retry', 'verify', `Repairing Ch ${expectedCh} (${reason})...`, expectedCh);
 
               let repairedOk = false;
-              for (let attempt = 1; attempt <= 3 && !repairedOk && !this.cancelled.has(job.id); attempt++) {
-                if (attempt > 1) await new Promise((r) => setTimeout(r, 900 * attempt));
+              let ssrMissingOrLockedReason = '';
+
+              for (let attempt = 1; attempt <= 4 && !repairedOk && !this.cancelled.has(job.id); attempt++) {
+                if (attempt > 1) await new Promise((r) => setTimeout(r, 1000 * attempt));
                 invalidateSnapshotsForCh(expectedCh);
 
-                const tryMode: WtrlabServiceMode =
-                  attempt === 2
-                    ? (jobServiceMode === 'web' ? 'webplus' : 'web')
-                    : jobServiceMode;
+                // Clear any transient 404 flag before repair attempt >= 2 unless SSR confirms missing
+                if (attempt >= 2 && isWtrlab) {
+                  const ssr = await probeWtrlabChapterSsrState(String(job.novelId), canonicalSlug, expectedCh, 'high');
+                  if (ssr.confirmedMissing || !ssr.exists) {
+                    ssrMissingOrLockedReason = `Chapter ${expectedCh} does not exist on wtr-lab.com (author skipped chapter number)`;
+                    break;
+                  }
+                  if (ssr.locked) {
+                    ssrMissingOrLockedReason = `Chapter ${expectedCh} is locked/unreleased on wtr-lab.com`;
+                    break;
+                  }
+                  jinaKnown404Until.delete(`https://wtr-lab.com/en/novel/${job.novelId}/${canonicalSlug}/chapter-${expectedCh}`);
+                }
+
+                const modeCycle: WtrlabServiceMode[] = [
+                  jobServiceMode,
+                  jobServiceMode === 'web' ? 'webplus' : 'web',
+                  'webplus',
+                  'web',
+                ];
+                const tryMode = modeCycle[(attempt - 1) % modeCycle.length];
 
                 const fresh = isWtrlab
                   ? await scrapeWtrlabChapterClean({
@@ -308,14 +343,11 @@
                       novelTitle: job.title,
                       skipCache: true,
                       priority: 'high',
-                      timeoutMs: 19000,
+                      timeoutMs: 18000 + attempt * 2000,
                     })
                   : null;
 
-                if (!fresh && isJinaUrlKnown404(`https://wtr-lab.com/en/novel/${job.novelId}/${canonicalSlug}/chapter-${expectedCh}`)) {
-                  break;
-                }
-                if (!fresh || fresh.paragraphs.length < 2) continue;
+                if (!fresh || fresh.paragraphs.length < 1) continue;
 
                 const processed = await processChapterByServiceMode({
                   title: normalizeWtrlabSlotTitle(fresh.title, expectedCh),
@@ -373,6 +405,18 @@
                 this.pushJobLog(job, 'ok', 'verify', `Repaired & verified Ch ${expectedCh}: "${finalTitle}"`, expectedCh);
               }
 
+              // If WTR-Lab itself genuinely skipped a chapter number in the middle (e.g. author jumped Ch 49 -> Ch 51),
+              // remove the non-existent ghost slot cleanly instead of failing the entire novel build!
+              if (!repairedOk && ssrMissingOrLockedReason && isWtrlab) {
+                const idxInArr = builtChapters.findIndex((x) => x.num === expectedCh);
+                if (idxInArr >= 0) builtChapters.splice(idxInArr, 1);
+                byNum.delete(expectedCh);
+                if (stats.placeholderCount > 0) stats.placeholderCount -= 1;
+                unavailableCount++;
+                this.pushJobLog(job, 'warn', 'verify', `${ssrMissingOrLockedReason} — omitted upstream gap cleanly.`, expectedCh);
+                repairedOk = true;
+              }
+
               if (!repairedOk) {
                 if (isPlaceholder) missingCount++;
                 else if (isDuplicate) duplicateCount++;
@@ -385,12 +429,13 @@
         );
       }
 
-      // Pass 3: Final Post-Repair Global Zero-Duplicate Audit
+      // Pass 3: Final Post-Repair Global Sequence & Zero-Duplicate Audit
+      builtChapters.sort((a, b) => a.num - b.num);
       const auditHashes = new Map<string, number>();
       const auditOpenings = new Map<string, number>();
-      for (let chNo = job.startChapter; chNo <= job.totalChapters; chNo++) {
-        const ch = byNum.get(chNo);
-        if (!ch || failedDetails.some((f) => f.ch === chNo)) continue;
+      for (const ch of builtChapters) {
+        const chNo = ch.num;
+        if (failedDetails.some((f) => f.ch === chNo)) continue;
         const pList = Array.isArray(ch.sourceEnParagraphs) && ch.sourceEnParagraphs.length > 0 ? ch.sourceEnParagraphs : ch.paragraphs;
         const fp = computeChapterFingerprint(pList);
         const owner =
@@ -409,14 +454,13 @@
         }
       }
 
-      const missingInSequence = Math.max(0, totalRequested - builtChapters.length);
       const summary: JobBuildVerificationSummary = {
-        total: totalRequested,
+        total: builtChapters.length,
         exact: exactCount,
         near: nearCount,
         repaired: repairedCount,
         mismatch: mismatchCount,
-        missing: missingCount + missingInSequence,
+        missing: missingCount,
         duplicate: duplicateCount,
         unavailable: unavailableCount,
       };
@@ -424,6 +468,7 @@
 
       const passedAll =
         !this.cancelled.has(job.id) &&
+        builtChapters.length > 0 &&
         failedDetails.length === 0 &&
         summary.missing === 0 &&
         summary.mismatch === 0 &&
@@ -475,13 +520,15 @@
         job.coverUrl = wtrlabLiveCoverMap.get(cleanNovelId) || normalizeWtrlabCoverUrl(matched?.coverUrl);
         if (job.coverUrl) warmWtrlabCoverAsync(job.coverUrl);
 
-        const detectedTotal = Number(matched?.chaptersCount || 0) || 128;
+        const detectedTotal = Number(matched?.chaptersCount || 0) || 100;
+        job.startChapter = Math.max(1, Number(job.startChapter) || 1);
         job.totalChapters =
           rangeMode === 'all'
             ? detectedTotal
             : explicitEndCh && explicitEndCh > 0
             ? (Number(matched?.chaptersCount || 0) > 0 ? Math.min(explicitEndCh, detectedTotal) : explicitEndCh)
             : detectedTotal;
+        job.totalChapters = Math.max(job.startChapter, job.totalChapters);
 
         job.status = 'downloading';
         const multiStats = this.ensureBuildStats(job);
@@ -532,7 +579,7 @@
         let completedCount = 0;
         let lastEditTime = Date.now();
         let nextChapterNum = job.startChapter;
-        let consecutivePlaceholderCount = 0;
+        let consecutiveConfirmed404 = 0;
         let abortDeadSource = false;
         const chConcurrency = Math.min(4, totalCount);
         const jobServiceMode = normalizeServiceMode(job.serviceMode);
@@ -546,6 +593,7 @@
               const slotIndex = chNum - job.startChapter;
 
               const cacheKey = `${cleanNovelId}:${chNum}:${targetLang}:${jobServiceMode}:${targetLang === 'hi' ? 'auto' : 'en'}`;
+              const enCacheKey = `${cleanNovelId}:${chNum}:en:${jobServiceMode}:en`;
               const cached = wtrlabChapterCache.get(cacheKey);
               let chTitle = targetLang === 'hi' ? `अध्याय ${chNum}` : `Chapter ${chNum}`;
               let paragraphs: string[] = [];
@@ -553,29 +601,45 @@
               let sourceEnParagraphs: string[] | undefined;
               let chapterOrigin = '';
 
-              if (cached && cached.paragraphs.length >= 2 && Date.now() - cached.timestamp < 24 * 60 * 60 * 1000) {
+              if (cached && cached.paragraphs.length >= 1 && Date.now() - cached.timestamp < 24 * 60 * 60 * 1000) {
                 chTitle = cached.title;
                 paragraphs = deduplicateChapterParagraphs(cached.paragraphs);
                 chapterOrigin = 'cache';
                 if (targetLang === 'en') {
                   sourceEnTitle = chTitle;
                   sourceEnParagraphs = [...paragraphs];
+                } else {
+                  const enCached = wtrlabChapterCache.get(enCacheKey);
+                  if (enCached && enCached.paragraphs.length >= 1) {
+                    sourceEnTitle = enCached.title;
+                    sourceEnParagraphs = deduplicateChapterParagraphs(enCached.paragraphs);
+                  }
                 }
               }
 
-              if (paragraphs.length < 2) {
+              // Inline resilient retry loop (up to 2 immediate passes during download so transient network/CSR hiccups recover right away!)
+              for (let dlAttempt = 1; dlAttempt <= 2 && paragraphs.length === 0 && !this.cancelled.has(job.id); dlAttempt++) {
+                if (dlAttempt === 2) {
+                  const chapterUrlKey = `https://wtr-lab.com/en/novel/${cleanNovelId}/${canonicalSlug}/chapter-${chNum}`;
+                  if (isJinaUrlKnown404(chapterUrlKey)) break;
+                  multiStats.retryCount += 1;
+                  await new Promise((r) => setTimeout(r, 850));
+                }
+
                 let scraped = await scrapeWtrlabChapterClean({
                   novelId: cleanNovelId,
                   slug: canonicalSlug,
                   chapterNo: chNum,
-                  serviceMode: jobServiceMode,
+                  serviceMode: dlAttempt === 2 ? (jobServiceMode === 'web' ? 'webplus' : jobServiceMode) : jobServiceMode,
                   language: 'en',
                   novelTitle: job.title,
+                  skipCache: dlAttempt > 1,
                   priority: 'high',
+                  timeoutMs: dlAttempt === 2 ? 21000 : 18000,
                 });
 
                 // Immediate in-flight duplicate guard: if content collides with an already-downloaded chapter, bypass cache & re-fetch!
-                if (scraped && scraped.paragraphs.length >= 2) {
+                if (scraped && scraped.paragraphs.length >= 1) {
                   const fp = computeChapterFingerprint(scraped.paragraphs);
                   const dupCh = fp.fullHash ? seenLiveFingerprints.get(fp.fullHash) : undefined;
                   if (dupCh && dupCh !== chNum) {
@@ -584,17 +648,17 @@
                       novelId: cleanNovelId,
                       slug: canonicalSlug,
                       chapterNo: chNum,
-                      serviceMode: jobServiceMode === 'web' ? 'webplus' : jobServiceMode,
+                      serviceMode: jobServiceMode === 'web' ? 'webplus' : 'web',
                       language: 'en',
                       novelTitle: job.title,
                       skipCache: true,
                       priority: 'high',
-                      timeoutMs: 19000,
+                      timeoutMs: 21000,
                     });
                   }
                 }
 
-                if (scraped && scraped.paragraphs.length >= 2) {
+                if (scraped && scraped.paragraphs.length >= 1) {
                   const processed = await processChapterByServiceMode({
                     title: scraped.title,
                     paragraphs: scraped.paragraphs,
@@ -606,6 +670,11 @@
                   sourceEnTitle = processed.title;
                   sourceEnParagraphs = [...processed.paragraphs];
                   chapterOrigin = scraped.origin;
+                  wtrlabChapterCache.set(enCacheKey, {
+                    title: processed.title,
+                    paragraphs: processed.paragraphs,
+                    timestamp: Date.now(),
+                  });
 
                   const fp = computeChapterFingerprint(paragraphs);
                   if (fp.fullHash && !seenLiveFingerprints.has(fp.fullHash)) {
@@ -614,26 +683,27 @@
                 }
               }
 
-              const isPlaceholder = paragraphs.length < 2;
+              const isPlaceholder = paragraphs.length === 0;
               if (isPlaceholder) {
                 chTitle = `Chapter ${chNum}`;
                 paragraphs = [
-                  `[Chapter ${chNum} of "${job.title}" could not be retrieved on initial pass — queued for verification repair.]`,
+                  `[Chapter ${chNum} of "${job.title}" queued for deep verification recovery.]`,
                 ];
                 multiStats.placeholderCount += 1;
-                consecutivePlaceholderCount += 1;
-                this.pushJobLog(job, 'warn', 'fetch', `Initial fetch missed Ch ${chNum} — queued for repair pass.`, chNum);
+                this.pushJobLog(job, 'warn', 'fetch', `Initial fetch missed Ch ${chNum} — queued for 4-attempt verification repair.`, chNum);
 
-                const isKnown404 = isJinaUrlKnown404(`https://wtr-lab.com/en/novel/${cleanNovelId}/${canonicalSlug}/chapter-${chNum}`);
-                if (
-                  (multiStats.verifiedCount === 0 && consecutivePlaceholderCount >= (isKnown404 ? 4 : 10)) ||
-                  consecutivePlaceholderCount >= 20
-                ) {
-                  abortDeadSource = true;
-                  this.pushJobLog(job, 'error', 'fetch', `Aborting early: ${consecutivePlaceholderCount} consecutive chapters failed/404.`, chNum);
+                const isConfirmed404 = isJinaUrlKnown404(`https://wtr-lab.com/en/novel/${cleanNovelId}/${canonicalSlug}/chapter-${chNum}`);
+                if (isConfirmed404) {
+                  consecutiveConfirmed404 += 1;
+                  if (multiStats.verifiedCount === 0 && consecutiveConfirmed404 >= 5) {
+                    abortDeadSource = true;
+                    this.pushJobLog(job, 'error', 'fetch', `Aborting: novel #${cleanNovelId} chapters confirmed 404 on WTR-Lab.`, chNum);
+                  }
+                } else {
+                  consecutiveConfirmed404 = 0;
                 }
               } else {
-                consecutivePlaceholderCount = 0;
+                consecutiveConfirmed404 = 0;
                 if (targetLang === 'hi' && paragraphs.some((p) => hasEnglishLeakage(p))) {
                   const activeEngine = loadBotConfig().translationEngine === 'gemini' ? 'gemini' : 'google';
                   const translated = await translateParagraphsToHindi(paragraphs, chNum, chTitle, cleanNovelId, activeEngine);
@@ -697,7 +767,6 @@
         const isTxt = job.format === 'txt';
         const isHindi = job.language === 'hi';
         const docTitle = isHindi ? `${job.title} [Hindi Edition]` : job.title;
-        job.filename = buildSafeNovelFilename(job.title, isHindi ? '_Hindi' : '', job.startChapter, job.totalChapters, isTxt);
 
         const gate = await this.verifyAndRepairBuiltChapters({
           job,
@@ -709,6 +778,9 @@
           isWtrlab: true,
           isFanmtl: false,
         });
+
+        const finalEndChapter = chapters.length > 0 ? chapters[chapters.length - 1].num : job.totalChapters;
+        job.filename = buildSafeNovelFilename(job.title, isHindi ? '_Hindi' : '', job.startChapter, finalEndChapter, isTxt);
 
         job.status = 'compiling';
         job.progress = 94;
@@ -749,7 +821,7 @@
               job.chatId,
               fileBuffer,
               job.filename,
-              `✅ <b>${escapeXml(job.title)}</b>\n📑 Chapters: <b>${job.startChapter}–${job.totalChapters}</b> (${chapters.length} Verified Exact)\n📦 Size: <code>${kbLabel} KB</code>`
+              `✅ <b>${escapeXml(job.title)}</b>\n📑 Chapters: <b>${job.startChapter}–${finalEndChapter}</b> (${chapters.length} Verified Exact · 0 Missing · 0 Duplicates)\n📦 Size: <code>${kbLabel} KB</code>`
             );
             multiStats.telegramDelivered = true;
           } catch (tgErr: any) {
