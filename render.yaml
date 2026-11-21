@@ -1,0 +1,29 @@
+# Render Blueprint - deploy with: Dashboard > New > Blueprint > select this repo.
+services:
+  - type: web
+    name: wtrlab-telegram-bot
+    runtime: node
+    plan: free # upgrade to "starter" for an always-on instance + persistent disk
+    region: oregon
+    branch: main
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: BOT_TOKEN
+        sync: false # you will be prompted for it during Blueprint setup
+      - key: USE_WEBHOOK
+        value: "true" # Render exposes RENDER_EXTERNAL_URL automatically
+      - key: API_AUTH_TOKEN
+        generateValue: true # protects /api/* ; read it in the dashboard
+      - key: DATA_DIR
+        value: /tmp/wtrlab-data
+      - key: JINA_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: ALLOWED_CHAT_IDS
+        sync: false
