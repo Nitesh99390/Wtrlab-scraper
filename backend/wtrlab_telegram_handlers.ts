@@ -36,11 +36,16 @@
         matched.title.includes('(WTR-Lab #');
       const isStaleMeta = !matched?.updatedAtMs || (Date.now() - Number(matched.updatedAtMs) > 15 * 60 * 1000);
       const lacksRealSlug = !matched?.slug || matched.slug === 'novel' || /^novel-\d+$/i.test(matched.slug);
+      const lacksVerifiedCountOrAuthor =
+        !matched?.chaptersCount ||
+        Boolean(matched?.hasUnverifiedCount) ||
+        !matched?.author ||
+        matched.author === 'WTR-Lab Author';
 
-      if (hasGenericTitle || isStaleMeta || lacksRealSlug || !matched?.chaptersCount) {
+      if (hasGenericTitle || isStaleMeta || lacksRealSlug || lacksVerifiedCountOrAuthor) {
         const liveMeta = await Promise.race([
-          fetchWtrlabLiveMetadata(cleanId, slugHint || matched?.slug, isStaleMeta).catch(() => null),
-          new Promise<null>((r) => setTimeout(() => r(null), 9000)),
+          fetchWtrlabLiveMetadata(cleanId, slugHint || matched?.slug, isStaleMeta || lacksVerifiedCountOrAuthor).catch(() => null),
+          new Promise<null>((r) => setTimeout(() => r(null), 22000)),
         ]);
         if (liveMeta) {
           matched = { ...(matched || {}), ...liveMeta };
@@ -56,12 +61,24 @@
       const novelUrl = `https://wtr-lab.com/en/novel/${cleanId}/${canonicalSlug}`;
       const safeCover = wtrlabLiveCoverMap.get(cleanId) || normalizeWtrlabCoverUrl(matched?.coverUrl);
 
+      let knownChapters = Math.max(
+        Number(matched?.hasUnverifiedCount ? 0 : matched?.chaptersCount) || 0,
+        Number(wtrlabKnownTotalChapters.get(cleanId) || 0)
+      );
+      if (knownChapters <= 0) {
+        const quickProbe = await probeWtrlabChapterSsrState(cleanId, canonicalSlug, 1, 'high').catch(() => null);
+        if (quickProbe?.totalChapters && quickProbe.totalChapters > 0) {
+          knownChapters = quickProbe.totalChapters;
+        }
+      }
+
       return {
         novelId: cleanId,
         slug: canonicalSlug,
         title: humanTitle,
         author: matched?.author || 'WTR-Lab Author',
-        totalChapters: Math.max(1, Number(matched?.chaptersCount) || 100),
+        totalChapters: Math.max(1, knownChapters || Number(matched?.chaptersCount) || 100),
+        hasUnverifiedCount: knownChapters <= 0,
         status: matched?.status || 'Ongoing',
         coverUrl: safeCover,
         novelUrl,
@@ -76,6 +93,7 @@
           novelId: `wtr_${info.novelId}`,
           title: info.title,
           totalChapters: info.totalChapters,
+          hasUnverifiedCount: info.hasUnverifiedCount,
           platform: 'wtrlab',
           coverUrl: info.coverUrl || undefined,
         });

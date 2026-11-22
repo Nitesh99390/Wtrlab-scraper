@@ -8,6 +8,7 @@ export type RegisteredNovel = {
   novelId: string;
   title: string;
   totalChapters: number;
+  hasUnverifiedCount?: boolean;
   platform: string;
   coverUrl?: string;
 };

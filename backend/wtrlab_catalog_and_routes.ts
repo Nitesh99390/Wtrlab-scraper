@@ -158,10 +158,70 @@
     return out.slice(0, 5);
   }
 
+  function parseWtrlabNovelMarkdownFallback(md: string, novelId: string, slugHint?: string): any | null {
+    if (!md || md.length < 200) return null;
+    if (md.includes('Warning: Target URL returned error 404')) return null;
+
+    const titleFromH1 = md.match(/^#\s+(.+)$/m)?.[1]?.trim() || '';
+    const titleFromHead = (md.match(/^Title:\s*(.+)$/m)?.[1] || '')
+      .replace(/^Read\s+/i, '')
+      .replace(/\s+RAW\s+English\s+Translation.*$/i, '')
+      .replace(/\s*[-|–—]\s*WTR-?LAB.*$/i, '')
+      .trim();
+    const realTitle = cleanWtrlabRawText(titleFromH1 || titleFromHead);
+    if (!realTitle || /^wtr-?lab$/i.test(realTitle) || /adform\.net|404/i.test(realTitle)) return null;
+
+    const chMatch =
+      md.match(/\bChapters\s+(\d{1,6})\b/i) ||
+      md.match(/\bAI-Unlock\s+Progress[\s\r\n]+(\d{1,6})\s*\/\s*(\d{1,6})\b/i);
+    const chCount = chMatch ? parseInt(chMatch[2] || chMatch[1], 10) : 0;
+    if (!chCount || chCount <= 0) return null;
+
+    const statusMatch = md.match(/\bStatus[\s\r\n]+(Completed|Ongoing|Hiatus|Dropped)\b/i);
+    const realStatus = statusMatch && /completed/i.test(statusMatch[1]) ? 'Completed' : 'Ongoing';
+
+    let realAuthor = '';
+    const authorLinks = [...md.matchAll(/\[([^\]]+)\]\(https:\/\/wtr-lab\.com\/[a-z]{2}\/author\/[^)]+\)/gi)].map((m) => m[1].trim());
+    if (authorLinks.length > 0) {
+      // Prefer romanized/Latin author name if WTR-Lab lists both raw CJK and Latin links
+      realAuthor = authorLinks.find((a) => /[A-Za-z]/.test(a)) || authorLinks[0];
+    }
+
+    const slugFromUrl = md.match(/wtr-lab\.com\/[a-z]{2}\/novel\/\d+\/([a-z0-9][a-z0-9_-]*)/i)?.[1] || '';
+    const realSlug =
+      (slugFromUrl && slugFromUrl !== 'novel' ? slugFromUrl : '') ||
+      (slugHint && slugHint !== 'novel' ? slugHint : '') ||
+      realTitle.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+
+    const imgMatch = md.match(/!\[[^\]]*\]\((https:\/\/(?:img\.)?wtr-lab\.com\/[^)\s]+)\)/i);
+    const realCover = normalizeWtrlabCoverUrl(imgMatch?.[1] || '');
+
+    const summaryMatch = md.match(/Novel Summary[\s\r\n]+([\s\S]{20,900}?)(?:\r?\n\r?\n(?:Show more|Details|Edit History)|\r?\nDetails\b)/i);
+    const realDesc = cleanWtrlabRawText(summaryMatch?.[1] || `Read ${realTitle} on WTR-Lab.`);
+
+    return {
+      title: realTitle,
+      author: cleanWtrlabRawText(realAuthor || 'WTR-Lab Author'),
+      slug: realSlug,
+      coverUrl: realCover,
+      chaptersCount: chCount,
+      status: realStatus,
+      description: realDesc,
+    };
+  }
+
   async function fetchWtrlabLiveMetadata(novelId: string, urlSlug?: string, forceRefresh = false): Promise<any | null> {
     const cacheKey = String(novelId).trim();
     const cached = wtrlabLiveMetaCache.get(cacheKey);
-    if (!forceRefresh && cached && Date.now() - cached.fetchedAt < 15 * 60 * 1000) {
+    const cachedHasCompleteMeta =
+      cached?.data &&
+      Number(cached.data.chaptersCount) > 0 &&
+      !cached.data.hasUnverifiedCount &&
+      cached.data.author &&
+      cached.data.author !== 'WTR-Lab Author' &&
+      cached.data.slug &&
+      cached.data.slug !== 'novel';
+    if (!forceRefresh && cached && cachedHasCompleteMeta && Date.now() - cached.fetchedAt < 15 * 60 * 1000) {
       return cached.data;
     }
 
@@ -171,25 +231,112 @@
         (urlSlug && urlSlug !== 'novel' && !/^novel-\d+$/i.test(urlSlug) ? urlSlug : '') ||
         (existingPrev?.slug && existingPrev.slug !== 'novel' && !/^novel-\d+$/i.test(existingPrev.slug) ? existingPrev.slug : '');
 
-      let html = await fetchWtrlabHtmlViaJina(
-        `https://wtr-lab.com/en/novel/${cacheKey}/${effectiveSlug || 'novel'}`,
-        11000
-      );
-      if (!html && effectiveSlug) {
-        html = await fetchWtrlabHtmlViaJina(`https://wtr-lab.com/en/novel/${cacheKey}/novel`, 11000);
+      const targetNovelUrl = `https://wtr-lab.com/en/novel/${cacheKey}/${effectiveSlug || 'novel'}`;
+      let html = await fetchWtrlabHtmlViaJina(targetNovelUrl, 12000, 'high', forceRefresh);
+      if ((!html || !html.includes('__NEXT_DATA__')) && effectiveSlug) {
+        html = await fetchWtrlabHtmlViaJina(`https://wtr-lab.com/en/novel/${cacheKey}/novel`, 12000, 'high', true);
       }
-      if (!html) return existingPrev || null;
+      if (!html || !html.includes('__NEXT_DATA__')) {
+        // Retry once with explicit cache-bypass in case Jina served a cached tracker/CSR shell
+        html = await fetchWtrlabHtmlViaJina(targetNovelUrl, 13000, 'high', true);
+      }
 
-      const $ = cheerio.load(html);
-      const nextDataRaw = $('#__NEXT_DATA__').html();
-      if (!nextDataRaw) return existingPrev || null;
+      let sd: any = null;
+      let ogImg = '';
+      if (html && html.includes('__NEXT_DATA__')) {
+        const $ = cheerio.load(html);
+        ogImg = normalizeWtrlabCoverUrl($('meta[property="og:image"]').attr('content'));
+        const nextDataRaw = $('#__NEXT_DATA__').html();
+        if (nextDataRaw) {
+          try {
+            const parsed = JSON.parse(nextDataRaw);
+            sd = parsed?.props?.pageProps?.serie?.serie_data || null;
+          } catch {}
+        }
+      }
 
-      const parsed = JSON.parse(nextDataRaw);
-      const sd = parsed?.props?.pageProps?.serie?.serie_data;
-      if (!sd || !sd.data?.title) return existingPrev || null;
+      // Secondary Fallback: Jina Markdown view of the novel page (extracts exact Chapters, Status, Author, Cover)
+      if (!sd || !sd.data?.title) {
+        const mdFallbackRaw = await fetchJinaWithHeaders(
+          targetNovelUrl,
+          { 'X-No-Cache': 'true', 'X-Retain-Images': 'all' },
+          12000,
+          'high'
+        );
+        const mdParsed = parseWtrlabNovelMarkdownFallback(mdFallbackRaw || '', cacheKey, effectiveSlug);
+        if (mdParsed) {
+          const realRawId = cacheKey;
+          if (mdParsed.slug && mdParsed.slug !== 'novel') {
+            wtrlabResolvedSlugCache.set(realRawId, mdParsed.slug);
+          }
+          if (mdParsed.chaptersCount > 0) {
+            wtrlabKnownTotalChapters.set(realRawId, mdParsed.chaptersCount);
+          }
+          if (mdParsed.coverUrl) {
+            wtrlabLiveCoverMap.set(realRawId, mdParsed.coverUrl);
+            warmWtrlabCoverAsync(mdParsed.coverUrl);
+          }
+          const genresList = resolveWtrlabGenres(existingPrev?.rawGenreIds || [], mdParsed.title, mdParsed.description, existingPrev?.genres);
+          const resolvedFromMd = {
+            ...(existingPrev || {}),
+            id: realRawId,
+            rawId: realRawId,
+            slug: mdParsed.slug,
+            title: mdParsed.title,
+            novelUrl: `https://wtr-lab.com/en/novel/${realRawId}/${mdParsed.slug}`,
+            coverUrl: mdParsed.coverUrl || normalizeWtrlabCoverUrl(existingPrev?.coverUrl) || '',
+            author: mdParsed.author,
+            genres: genresList,
+            chaptersCount: mdParsed.chaptersCount,
+            hasUnverifiedCount: false,
+            rating: existingPrev?.rating || 4.8,
+            status: mdParsed.status,
+            lastUpdated: 'Live WTR-Lab Sync',
+            updatedAtMs: Date.now(),
+            description: mdParsed.description,
+            isRealWtrlab: true,
+            isPlaceholderIndex: false,
+          };
+          wtrlabLiveMetaCache.set(cacheKey, { data: resolvedFromMd, fetchedAt: Date.now() });
+          wtrlabDynamicNovels.set(realRawId, resolvedFromMd);
+          scheduleWtrlabCatalogSave();
+          return resolvedFromMd;
+        }
+
+        // Tertiary Fallback: Fast Chapter-1 SSR probe (recovers real totalChapters + canonical slug!)
+        const ch1Probe = await probeWtrlabChapterSsrState(cacheKey, effectiveSlug || 'novel', 1, 'high');
+        if (ch1Probe.totalChapters && ch1Probe.totalChapters > 0) {
+          const pSlug = ch1Probe.realSlug || effectiveSlug || 'novel';
+          const pTitle =
+            existingPrev?.title ||
+            (pSlug !== 'novel' ? pSlug.replace(/-/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()) : `WTR-Lab Novel #${cacheKey}`);
+          const resolvedFromProbe = {
+            ...(existingPrev || {}),
+            id: cacheKey,
+            rawId: cacheKey,
+            slug: pSlug,
+            title: pTitle,
+            novelUrl: `https://wtr-lab.com/en/novel/${cacheKey}/${pSlug}`,
+            coverUrl: normalizeWtrlabCoverUrl(existingPrev?.coverUrl) || '',
+            author: existingPrev?.author || 'WTR-Lab Author',
+            genres: existingPrev?.genres || ['Action', 'Fantasy'],
+            chaptersCount: ch1Probe.totalChapters,
+            hasUnverifiedCount: false,
+            status: existingPrev?.status || 'Ongoing',
+            updatedAtMs: Date.now(),
+            isRealWtrlab: true,
+            isPlaceholderIndex: false,
+          };
+          wtrlabDynamicNovels.set(cacheKey, resolvedFromProbe);
+          return resolvedFromProbe;
+        }
+
+        return existingPrev || null;
+      }
 
       const realTitle = cleanWtrlabRawText(sd.data.title);
-      const realAuthor = cleanWtrlabRawText(sd.data.author || sd.author || 'WTR-Lab Author');
+      const rawAuthor = cleanWtrlabRawText(sd.data.author || sd.author || sd.data?.raw?.author || '');
+      const realAuthor = rawAuthor || (existingPrev?.author && existingPrev.author !== 'WTR-Lab Author' ? existingPrev.author : 'WTR-Lab Author');
       const realSlug = sd.slug || effectiveSlug || realTitle.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
       const realRawId = String(sd.raw_id || cacheKey);
 
@@ -200,10 +347,22 @@
       }
 
       const seriesImg = normalizeWtrlabCoverUrl(sd.data.image || sd.image);
-      const ogImg = normalizeWtrlabCoverUrl($('meta[property="og:image"]').attr('content'));
       const realCover = seriesImg || (ogImg.includes('/cdn/serie') ? ogImg : '');
-      const realCount = Number(sd.chapter_count || sd.raw_chapter_count) || existingPrev?.chaptersCount || 50;
-      const realStatus = sd.status === 1 || sd.raw_status === 1 ? 'Completed' : 'Ongoing';
+      const maxSsrCount = Math.max(
+        Number(sd.chapter_count || 0),
+        Number(sd.raw_chapter_count || 0),
+        Number(sd.unlock_count || 0),
+        Number(wtrlabKnownTotalChapters.get(realRawId) || 0)
+      );
+      const realCount = maxSsrCount || existingPrev?.chaptersCount || 50;
+      if (maxSsrCount > 0) {
+        wtrlabKnownTotalChapters.set(realRawId, maxSsrCount);
+        wtrlabKnownTotalChapters.set(cacheKey, maxSsrCount);
+      }
+      const realStatus =
+        sd.status === 1 || sd.raw_status === 1 || String(sd.status).toLowerCase() === 'completed'
+          ? 'Completed'
+          : 'Ongoing';
       const realDesc = cleanWtrlabRawText(sd.data.description || `Read ${realTitle} on WTR-Lab.`);
       const rawGenreIds: number[] = Array.isArray(sd.genres)
         ? sd.genres.map((g: any) => Number(g)).filter((n: number) => !isNaN(n) && n > 0)
@@ -230,6 +389,7 @@
         rawGenreIds,
         genres: genresList,
         chaptersCount: realCount,
+        hasUnverifiedCount: maxSsrCount <= 0,
         chaptersAdded: addedDelta > 0 ? addedDelta : undefined,
         rating: sd.rating ? parseFloat(Number(sd.rating).toFixed(1)) : (existingPrev?.rating || 4.8),
         status: realStatus,
@@ -327,10 +487,11 @@
   }
   loadWtrlabCatalogFromDisk();
 
-  // 3-Tier Priority Semaphore Pool for r.jina.ai with adaptive 429/422/5xx handling
+  // 3-Tier Priority Semaphore Pool for r.jina.ai with adaptive 429/422/5xx/ad-poison handling
   type JinaPriority = 'high' | 'medium' | 'low';
-  const MAX_HIGH_JINA_CONCURRENT = 4;
-  const MAX_MEDIUM_JINA_CONCURRENT = 3;
+  const HAS_JINA_API_KEY = Boolean(process.env.JINA_API_KEY && process.env.JINA_API_KEY.trim());
+  const MAX_HIGH_JINA_CONCURRENT = HAS_JINA_API_KEY ? 4 : 2;
+  const MAX_MEDIUM_JINA_CONCURRENT = HAS_JINA_API_KEY ? 3 : 2;
   let activeHighJina = 0;
   let activeMediumJina = 0;
   let activeLowJina = 0;
@@ -338,6 +499,7 @@
   let jinaRateLimitUntil = 0;
   let nextJinaDispatchAt = 0;
   let lastInteractiveJinaAt = 0;
+  let jinaAdaptiveGapBonusMs = 0;
   const jinaWaiters: Array<{ priority: JinaPriority; resolve: () => void }> = [];
 
   function canRunJinaPriority(priority: JinaPriority): boolean {
@@ -403,7 +565,10 @@
 
   async function reserveJinaDispatchDelay(priority: JinaPriority): Promise<void> {
     if (priority !== 'low') lastInteractiveJinaAt = Date.now();
-    const minGapMs = priority === 'high' ? 380 : priority === 'medium' ? 750 : 3500;
+    const baseGapMs = HAS_JINA_API_KEY
+      ? (priority === 'high' ? 380 : priority === 'medium' ? 750 : 3500)
+      : (priority === 'high' ? 1150 : priority === 'medium' ? 1800 : 4000);
+    const minGapMs = baseGapMs + (priority === 'low' ? 0 : jinaAdaptiveGapBonusMs);
     const now = Date.now();
     const startAt = Math.max(now, jinaRateLimitUntil, nextJinaDispatchAt);
     nextJinaDispatchAt = startAt + minGapMs;
@@ -412,6 +577,17 @@
   }
 
   let lastJinaDebug = '';
+
+  function isJinaPoisonedOrAdTrackerPayload(text: string): boolean {
+    if (!text) return false;
+    return (
+      text.includes('adform.net') ||
+      text.includes('monetixads') ||
+      text.includes('admatic.de') ||
+      text.includes('tacker probe') ||
+      text.includes('doubleclick.net')
+    );
+  }
 
   async function fetchJinaWithHeaders(
     targetUrl: string,
@@ -422,24 +598,29 @@
     if (isJinaUrlKnown404(targetUrl)) return null;
     await acquireJinaSlot(priority);
     const maxAttempts = priority === 'low' ? 2 : 3;
+    let forceNoCacheNext = false;
     try {
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
         await reserveJinaDispatchDelay(priority);
         try {
+          const effectiveHeaders = forceNoCacheNext
+            ? { ...headers, 'X-No-Cache': 'true' }
+            : headers;
           const res = await fetch(`https://r.jina.ai/${targetUrl}`, {
-            headers,
+            headers: effectiveHeaders,
             signal: AbortSignal.timeout(timeoutMs),
           });
           lastJinaDebug = `${res.status} (${targetUrl.replace('https://wtr-lab.com/en/', '')}) #${attempt + 1}`;
 
           if (res.status === 429) {
-            let retrySec = 3 + attempt * 3;
+            let retrySec = 4 + attempt * 4;
             try {
               const parsed = JSON.parse(await res.text());
               if (Number(parsed?.retryAfter) > 0) retrySec = Math.max(retrySec, Number(parsed.retryAfter) + 1);
             } catch {}
-            const cooldownMs = Math.min(10000, retrySec * 1000) + 250 + Math.floor(Math.random() * 450);
-            const until = Date.now() + Math.min(5500, cooldownMs);
+            jinaAdaptiveGapBonusMs = Math.min(1800, jinaAdaptiveGapBonusMs + 450);
+            const cooldownMs = Math.min(14000, retrySec * 1000) + 250 + Math.floor(Math.random() * 450);
+            const until = Date.now() + Math.min(8500, cooldownMs);
             jinaRateLimitUntil = Math.max(jinaRateLimitUntil, until);
             nextJinaDispatchAt = Math.max(nextJinaDispatchAt, until);
             if (attempt < maxAttempts - 1) {
@@ -467,7 +648,7 @@
           }
 
           if (res.status >= 500) {
-            const backMs = 800 + attempt * 500;
+            const backMs = 900 + attempt * 650;
             jinaRateLimitUntil = Math.max(jinaRateLimitUntil, Date.now() + backMs);
             if (attempt < maxAttempts - 1) {
               await new Promise((r) => setTimeout(r, backMs));
@@ -478,35 +659,59 @@
 
           if (!res.ok) return null;
           const text = await res.text();
+          if (jinaAdaptiveGapBonusMs > 0) {
+            jinaAdaptiveGapBonusMs = Math.max(0, jinaAdaptiveGapBonusMs - 100);
+          }
           if (text.includes('Warning: Target URL returned error 404')) {
             markJinaUrl404(targetUrl);
             return text;
           }
 
+          // Guard ALL endpoints (novel pages, search, HTML probes, AND chapters) against Jina cached ad-tracker poison!
+          if (isJinaPoisonedOrAdTrackerPayload(text)) {
+            forceNoCacheNext = true;
+            if (attempt < maxAttempts - 1) {
+              await new Promise((r) => setTimeout(r, 450 + attempt * 350));
+              continue;
+            }
+            return null;
+          }
+
+          // If an HTML request returned a CSR shell without __NEXT_DATA__ on a cached snapshot, retry with X-No-Cache
+          if (
+            effectiveHeaders['X-Return-Format'] === 'html' &&
+            !text.includes('__NEXT_DATA__') &&
+            !effectiveHeaders['X-No-Cache'] &&
+            attempt < maxAttempts - 1
+          ) {
+            forceNoCacheNext = true;
+            await new Promise((r) => setTimeout(r, 350));
+            continue;
+          }
+
           const isExplicitEmptyWebShell =
             /[?&]service=web(?:&|$)/i.test(targetUrl) &&
             (text.includes('Prev') || text.includes('Ch.')) &&
-            text.length < 900 &&
-            !text.includes('adform.net');
+            text.length < 900;
           const isTransientIncomplete =
             targetUrl.includes('/chapter-') &&
             !isExplicitEmptyWebShell &&
             !/AI Translation Requires Registration|Guests can preview AI translation/i.test(text) &&
-            (text.includes('adform.net') ||
-              text.includes('monetixads') ||
-              text.includes('admatic.de') ||
-              text.includes('tacker probe') ||
-              (text.includes('Warning: This page maybe not yet fully loaded') && text.length < 1400));
+            text.includes('Warning: This page maybe not yet fully loaded') &&
+            text.length < 1400;
 
           if (isTransientIncomplete && attempt < maxAttempts - 1) {
+            forceNoCacheNext = true;
             await new Promise((r) => setTimeout(r, 700 + attempt * 500));
             continue;
           }
           return text;
         } catch (err: any) {
           lastJinaDebug = `ERR:${err?.message || 'timeout'} (${targetUrl.replace('https://wtr-lab.com/en/', '')}) #${attempt + 1}`;
+          jinaAdaptiveGapBonusMs = Math.min(1800, jinaAdaptiveGapBonusMs + 250);
           if (attempt < maxAttempts - 1) {
-            await new Promise((r) => setTimeout(r, 550 + attempt * 450));
+            forceNoCacheNext = true;
+            await new Promise((r) => setTimeout(r, 700 + attempt * 550));
             continue;
           }
           return null;
@@ -521,9 +726,12 @@
   function fetchWtrlabHtmlViaJina(
     wtrUrl: string,
     timeoutMs = 10000,
-    priority: JinaPriority = 'high'
+    priority: JinaPriority = 'high',
+    noCache = false
   ): Promise<string | null> {
-    return fetchJinaWithHeaders(wtrUrl, { 'X-Return-Format': 'html' }, timeoutMs, priority);
+    const hdrs: Record<string, string> = { 'X-Return-Format': 'html' };
+    if (noCache) hdrs['X-No-Cache'] = 'true';
+    return fetchJinaWithHeaders(wtrUrl, hdrs, timeoutMs, priority);
   }
 
   function normalizeNovelTitleKey(raw: string): string {
@@ -645,9 +853,11 @@
         }
 
         const prevChCount = Number(existing.chaptersCount || 0);
-        if (liveChCount > prevChCount) {
-          const delta = prevChCount > 0 ? liveChCount - prevChCount : 0;
+        if (liveChCount > 0 && (liveChCount > prevChCount || existing.hasUnverifiedCount)) {
+          const delta = prevChCount > 0 && !existing.hasUnverifiedCount ? liveChCount - prevChCount : 0;
           existing.chaptersCount = liveChCount;
+          existing.hasUnverifiedCount = false;
+          wtrlabKnownTotalChapters.set(rawId, Math.max(wtrlabKnownTotalChapters.get(rawId) || 0, liveChCount));
           if (delta > 0) {
             existing.chaptersAdded = (existing.chaptersAdded || 0) + delta;
             existing.lastUpdated = `+${existing.chaptersAdded} New Ch${existing.chaptersAdded > 1 ? 's' : ''} · Live`;
@@ -676,6 +886,10 @@
         continue;
       }
 
+      if (liveChCount > 0) {
+        wtrlabKnownTotalChapters.set(rawId, Math.max(wtrlabKnownTotalChapters.get(rawId) || 0, liveChCount));
+      }
+
       const item: any = {
         id: rawId,
         rawId,
@@ -687,6 +901,7 @@
         rawGenreIds,
         genres: genreNames,
         chaptersCount: liveChCount || 100,
+        hasUnverifiedCount: liveChCount <= 0,
         rating: s.rating ? parseFloat(Number(s.rating).toFixed(1)) : 4.8,
         status: liveStatus,
         lastUpdated: opts?.newestOrderBase !== undefined ? 'New Novel · Live' : opts?.liveOrderBase !== undefined ? 'Updated Live' : tagLabel,
@@ -1342,10 +1557,12 @@
       ];
 
       for (let i = 0; i < targets.length; i++) {
+        if (activeWtrlabScrapeJobs > 0) break;
         const target = targets[i];
         try {
           if (i > 0) await new Promise((r) => setTimeout(r, 1200));
-          const items = await harvestWtrlabPageUrl(target.url, target.tag, 13000, true, target.rankBase, 'high', target.newestBase);
+          const syncPrio: JinaPriority = reason === 'manual' ? 'high' : 'medium';
+          const items = await harvestWtrlabPageUrl(target.url, target.tag, 13000, true, target.rankBase, syncPrio, target.newestBase);
           pushWtrlabSyncTrace(`T${i}:${items.length} [${lastJinaDebug}]`);
           if (items.length > 0) {
             totalHarvested += items.length;

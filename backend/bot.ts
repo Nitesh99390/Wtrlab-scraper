@@ -169,10 +169,13 @@ async function onCallback(cb: any): Promise<void> {
       const total = Math.max(1, Number(n) || novel.totalChapters || 1);
       if (kind === 'custom') {
         await tg.answerCallbackQuery(cb.id);
+        const rangeHint = novel.hasUnverifiedCount
+          ? `jaise <code>10-50</code> ya <code>1-235</code>`
+          : `jaise <code>10-50</code> (1–${total.toLocaleString()})`;
         pendingCustom.set(chatId, { token, total, expires: Date.now() + PENDING_TTL_MS });
         await tg.sendMessage(
           chatId,
-          `⚙️ <b>${escapeXml(novel.title)}</b>\nApni chapter range bhejein, jaise <code>10-50</code> (1–${total.toLocaleString()}).\n/cancel se wapas.`
+          `⚙️ <b>${escapeXml(novel.title)}</b>\nApni chapter range bhejein, ${rangeHint}.\n/cancel se wapas.`
         );
         return;
       }
@@ -227,11 +230,14 @@ async function startScrape(chatId: string, token: string, start: number, end: nu
     await tg.sendMessage(chatId, 'Range galat hai (start ≥ 1 aur end ≥ start hona chahiye).');
     return;
   }
-  if (rangeMode === 'custom' && start > novel.totalChapters) {
+  if (rangeMode === 'custom' && !novel.hasUnverifiedCount && start > novel.totalChapters) {
     await tg.sendMessage(chatId, `Is novel me sirf <b>${novel.totalChapters.toLocaleString()}</b> chapters hain.`);
     return;
   }
-  const endCh = rangeMode === 'custom' ? Math.min(end, Math.max(novel.totalChapters, start)) : end;
+  const endCh =
+    rangeMode === 'custom'
+      ? (novel.hasUnverifiedCount ? end : Math.min(end, Math.max(novel.totalChapters, start)))
+      : end;
 
   const prefs = getPrefs(chatId);
   const sent = await tg.sendMessage(

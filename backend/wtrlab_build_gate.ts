@@ -294,7 +294,7 @@
       // Pass 2B: Multi-Attempt Deep Repair Pool (4 escalating attempts + SSR author-gap / locked-chapter handling)
       if (flaggedTasks.length > 0 && !this.cancelled.has(job.id)) {
         let cursor = 0;
-        const workers = Math.min(3, flaggedTasks.length);
+        const workers = Math.min(HAS_JINA_API_KEY ? 3 : 2, flaggedTasks.length);
 
         await Promise.all(
           Array.from({ length: workers }, async () => {
@@ -308,21 +308,26 @@
               let ssrMissingOrLockedReason = '';
 
               for (let attempt = 1; attempt <= 4 && !repairedOk && !this.cancelled.has(job.id); attempt++) {
-                if (attempt > 1) await new Promise((r) => setTimeout(r, 1000 * attempt));
+                if (attempt > 1) await new Promise((r) => setTimeout(r, 1200 * attempt));
                 invalidateSnapshotsForCh(expectedCh);
 
-                // Clear any transient 404 flag before repair attempt >= 2 unless SSR confirms missing
-                if (attempt >= 2 && isWtrlab) {
-                  const ssr = await probeWtrlabChapterSsrState(String(job.novelId), canonicalSlug, expectedCh, 'high');
-                  if (ssr.confirmedMissing || !ssr.exists) {
-                    ssrMissingOrLockedReason = `Chapter ${expectedCh} does not exist on wtr-lab.com (author skipped chapter number)`;
-                    break;
+                // Clear any transient 404 flag on EVERY repair attempt unless SSR confirms missing/locked
+                if (isWtrlab) {
+                  const base404Key = normalizeJinaBaseUrl(
+                    `https://wtr-lab.com/en/novel/${job.novelId}/${canonicalSlug}/chapter-${expectedCh}`
+                  );
+                  if (attempt >= 2 || isJinaUrlKnown404(base404Key)) {
+                    const ssr = await probeWtrlabChapterSsrState(String(job.novelId), canonicalSlug, expectedCh, 'high');
+                    if (ssr.confirmedMissing || !ssr.exists) {
+                      ssrMissingOrLockedReason = `Chapter ${expectedCh} does not exist on wtr-lab.com (author skipped chapter number)`;
+                      break;
+                    }
+                    if (ssr.locked) {
+                      ssrMissingOrLockedReason = `Chapter ${expectedCh} is locked/unreleased on wtr-lab.com`;
+                      break;
+                    }
+                    jinaKnown404Until.delete(base404Key);
                   }
-                  if (ssr.locked) {
-                    ssrMissingOrLockedReason = `Chapter ${expectedCh} is locked/unreleased on wtr-lab.com`;
-                    break;
-                  }
-                  jinaKnown404Until.delete(`https://wtr-lab.com/en/novel/${job.novelId}/${canonicalSlug}/chapter-${expectedCh}`);
                 }
 
                 const modeCycle: WtrlabServiceMode[] = [
@@ -343,7 +348,7 @@
                       novelTitle: job.title,
                       skipCache: true,
                       priority: 'high',
-                      timeoutMs: 18000 + attempt * 2000,
+                      timeoutMs: 19000 + attempt * 2500,
                     })
                   : null;
 
@@ -501,9 +506,10 @@
           Boolean(matched.isPlaceholderIndex) ||
           /^WTR-Lab Novel #?\d+$/i.test(matched.title);
         const isStaleMeta = !matched?.updatedAtMs || (Date.now() - Number(matched.updatedAtMs) > 15 * 60 * 1000);
+        const hasUnverifiedTotal = Boolean(matched?.hasUnverifiedCount) || !matched?.chaptersCount;
 
-        if (hasGenericTitle || rangeMode === 'all' || !explicitEndCh || isStaleMeta || !matched?.slug || matched.slug === 'novel') {
-          const liveMeta = await fetchWtrlabLiveMetadata(cleanNovelId, urlSlug || matched?.slug, rangeMode === 'all' || isStaleMeta).catch(() => null);
+        if (hasGenericTitle || hasUnverifiedTotal || rangeMode === 'all' || !explicitEndCh || isStaleMeta || !matched?.slug || matched.slug === 'novel') {
+          const liveMeta = await fetchWtrlabLiveMetadata(cleanNovelId, urlSlug || matched?.slug, rangeMode === 'all' || isStaleMeta || hasUnverifiedTotal).catch(() => null);
           if (liveMeta) {
             matched = { ...(matched || {}), ...liveMeta, id: cleanNovelId };
           } else if (isJinaUrlKnown404(`https://wtr-lab.com/en/novel/${cleanNovelId}/novel`)) {
@@ -520,13 +526,23 @@
         job.coverUrl = wtrlabLiveCoverMap.get(cleanNovelId) || normalizeWtrlabCoverUrl(matched?.coverUrl);
         if (job.coverUrl) warmWtrlabCoverAsync(job.coverUrl);
 
-        const detectedTotal = Number(matched?.chaptersCount || 0) || 100;
+        let verifiedTotal = Math.max(
+          Number(matched?.hasUnverifiedCount ? 0 : matched?.chaptersCount) || 0,
+          Number(wtrlabKnownTotalChapters.get(cleanNovelId) || 0)
+        );
+        if (verifiedTotal <= 0 && (rangeMode === 'all' || !explicitEndCh)) {
+          const ssrProbe1 = await probeWtrlabChapterSsrState(cleanNovelId, canonicalSlug, 1, 'high').catch(() => null);
+          if (ssrProbe1?.totalChapters && ssrProbe1.totalChapters > 0) {
+            verifiedTotal = ssrProbe1.totalChapters;
+          }
+        }
+        const detectedTotal = verifiedTotal || Number(matched?.chaptersCount || 0) || 100;
         job.startChapter = Math.max(1, Number(job.startChapter) || 1);
         job.totalChapters =
           rangeMode === 'all'
             ? detectedTotal
             : explicitEndCh && explicitEndCh > 0
-            ? (Number(matched?.chaptersCount || 0) > 0 ? Math.min(explicitEndCh, detectedTotal) : explicitEndCh)
+            ? (verifiedTotal > 0 ? Math.min(explicitEndCh, verifiedTotal) : explicitEndCh)
             : detectedTotal;
         job.totalChapters = Math.max(job.startChapter, job.totalChapters);
 
@@ -581,7 +597,7 @@
         let nextChapterNum = job.startChapter;
         let consecutiveConfirmed404 = 0;
         let abortDeadSource = false;
-        const chConcurrency = Math.min(4, totalCount);
+        const chConcurrency = Math.min(HAS_JINA_API_KEY ? 4 : 2, totalCount);
         const jobServiceMode = normalizeServiceMode(job.serviceMode);
         const targetLang = job.language === 'hi' ? 'hi' : 'en';
 
@@ -790,9 +806,9 @@
             'verify',
             `Gate still failing for ${gate.failedDetails.length} chapter(s) [${gate.failedDetails.slice(0, 8).map((f) => f.ch).join(', ')}] — extra repair pass ${extraPass}/2 after cool-down...`
           );
-          await new Promise((r) => setTimeout(r, 4000 * extraPass));
+          await new Promise((r) => setTimeout(r, 4500 * extraPass));
           for (const f of gate.failedDetails) {
-            jinaKnown404Until.delete(`https://wtr-lab.com/en/novel/${cleanNovelId}/${canonicalSlug}/chapter-${f.ch}`);
+            jinaKnown404Until.delete(normalizeJinaBaseUrl(`https://wtr-lab.com/en/novel/${cleanNovelId}/${canonicalSlug}/chapter-${f.ch}`));
           }
           gate = await runGate();
         }

@@ -45,6 +45,9 @@
   const wtrlabResolvedSlugCache = new Map<string, string>();
   const wtrlabSlugInflight = new Map<string, Promise<string>>();
 
+  // Per-novel authoritative live chapter count & AI-unlock count learned from SSR __NEXT_DATA__
+  const wtrlabKnownTotalChapters = new Map<string, number>();
+
   // In-flight single-flight deduplicator for identical chapter fetches
   const wtrlabChapterInflight = new Map<string, Promise<{ title: string; paragraphs: string[]; modeUsed: WtrlabServiceMode; source: string } | null>>();
 
@@ -54,7 +57,9 @@
 
   function normalizeJinaBaseUrl(rawUrl: string): string {
     return String(rawUrl || '')
-      .replace(/([?&])_cb=\d+&?/g, '$1')
+      .replace(/([?&])(?:service=(?:webplus|web|ai)|_cb=\d+)(?=&|$)/gi, '$1')
+      .replace(/\?&+/g, '?')
+      .replace(/&&+/g, '&')
       .replace(/[?&]$/, '');
   }
 
@@ -486,8 +491,13 @@
       if (realSlug && realSlug !== 'novel') {
         wtrlabResolvedSlugCache.set(String(novelId), String(realSlug));
       }
+      const ssrTotalCh = Math.max(Number(sd?.chapter_count || 0), Number(sd?.raw_chapter_count || 0));
+      if (ssrTotalCh > 0) {
+        const prevKnown = wtrlabKnownTotalChapters.get(String(novelId)) || 0;
+        if (ssrTotalCh > prevKnown) wtrlabKnownTotalChapters.set(String(novelId), ssrTotalCh);
+      }
       if (!chObj || (chObj.order !== undefined && Number(chObj.order) !== chapterNo)) {
-        return { exists: false, confirmedMissing: true, locked: false, released: false, realSlug };
+        return { exists: false, confirmedMissing: true, locked: false, released: false, realSlug, totalChapters: ssrTotalCh || undefined };
       }
 
       return {
@@ -497,7 +507,7 @@
         released: chObj.released !== false,
         ssrTitle: chObj.title ? String(chObj.title).trim() : undefined,
         realSlug: realSlug ? String(realSlug) : undefined,
-        totalChapters: Number(sd?.chapter_count || sd?.raw_chapter_count || 0) || undefined,
+        totalChapters: ssrTotalCh || undefined,
       };
     } catch {
       // Network hiccup during probe -> assume chapter exists and allow retry
@@ -681,6 +691,17 @@
         l.length <= 125
           ? l.match(/^(?:\*\*)?((?:Chapter|Ch\.?)\s+[A-Za-z-]+(?:\s+[A-Za-z-]+){0,5}(?:\s*[:\-–—]\s*.{1,100})?)(?:\*\*)?$/i)
           : null;
+
+      // Ignore fullpage site header H1 matching the novel title itself (when fullpage-no-wait fallback renders main layout)
+      if (
+        hashHeading &&
+        /^#\s+/.test(l) &&
+        expectedNovelTitle &&
+        !extractChapterNumberFromHeading(hashHeading[1]) &&
+        titleMatchesCandidate(expectedNovelTitle, hashHeading[1])
+      ) {
+        continue;
+      }
 
       let candidateTitle = '';
       if (hashHeading && l.length <= 150) {
@@ -927,38 +948,35 @@
         return `https://wtr-lab.com/en/novel/${cleanId}/${slugToUse}/chapter-${chapterNo}${qs}`;
       };
 
-      const buildBrowserHeaders = (mode: 'strict' | 'wide' | 'no-wait', waitSec: string): Record<string, string> => {
-        if (mode === 'strict') {
-          return {
-            'X-Engine': 'browser',
-            'X-Target-Selector': 'div.chapter-wrap:first-of-type',
-            'X-Wait-For-Selector': 'div.chapter-wrap:first-of-type .chapter-body p, .chapter-body p',
-            'X-Remove-Selector': 'iframe, script, style, noscript, ins, .ads, .ad, .adsbygoogle',
-            'X-Retain-Images': 'none',
-            'X-Timeout': waitSec,
-            'X-No-Cache': 'true',
-          };
-        }
-        if (mode === 'wide') {
-          return {
-            'X-Engine': 'browser',
-            'X-Target-Selector': 'div.reader-container, div.chapter-wrap, main',
-            'X-Wait-For-Selector': '.chapter-body p, div.chapter-wrap p',
-            'X-Remove-Selector': 'iframe, script, style, noscript, ins, .ads, .ad, .adsbygoogle',
-            'X-Retain-Images': 'none',
-            'X-Timeout': waitSec,
-            'X-No-Cache': 'true',
-          };
-        }
-        // 'no-wait' never throws Jina 422 even if unusual HTML tags (<br>/<div>) are used instead of <p>!
-        return {
+      const buildBrowserHeaders = (
+        mode: 'strict' | 'wide' | 'no-wait' | 'fullpage-no-wait',
+        waitSec: string,
+        noCache = true
+      ): Record<string, string> => {
+        const base: Record<string, string> = {
           'X-Engine': 'browser',
-          'X-Target-Selector': 'div.chapter-wrap:first-of-type, div.reader-container, main',
           'X-Remove-Selector': 'iframe, script, style, noscript, ins, .ads, .ad, .adsbygoogle',
           'X-Retain-Images': 'none',
           'X-Timeout': waitSec,
-          'X-No-Cache': 'true',
         };
+        if (noCache) base['X-No-Cache'] = 'true';
+        if (mode === 'strict') {
+          base['X-Target-Selector'] = 'div.chapter-wrap:first-of-type';
+          base['X-Wait-For-Selector'] = 'div.chapter-wrap:first-of-type .chapter-body p, .chapter-body p';
+          return base;
+        }
+        if (mode === 'wide') {
+          base['X-Target-Selector'] = 'div.reader-container, div.chapter-wrap, main';
+          base['X-Wait-For-Selector'] = '.chapter-body p, div.chapter-wrap p';
+          return base;
+        }
+        if (mode === 'no-wait') {
+          // 'no-wait' never throws Jina 422 even if unusual HTML tags (<br>/<div>) are used instead of <p>!
+          base['X-Target-Selector'] = 'div.chapter-wrap:first-of-type, div.reader-container, main';
+          return base;
+        }
+        // 'fullpage-no-wait' drops X-Target-Selector & X-Wait-For-Selector altogether for maximum resilience
+        return base;
       };
 
       let ssrStateChecked = false;
@@ -987,7 +1005,9 @@
         if (isJinaUrlKnown404(get404Key(canonicalSlug))) return null;
 
         if (priority === 'high') lastInteractiveJinaAt = Date.now();
-        const headers = buildBrowserHeaders(options?.noTargetSelector ? 'wide' : 'strict', options?.jinaWaitSec || '14');
+        // Fast path first: allow Jina snapshot cache on initial read (protected by fetchJinaWithHeaders anti-ad & anti-incomplete guards),
+        // then switch to explicit X-No-Cache + cacheBust on any retry!
+        const headers = buildBrowserHeaders(options?.noTargetSelector ? 'wide' : 'strict', options?.jinaWaitSec || '15', Boolean(options?.retryWithCacheBust === false));
         const md = await fetchJinaWithHeaders(targetUrl, headers, reqTimeoutMs, priority);
 
         // If md came back null (e.g. Jina 422 selector timeout or network timeout), run the fast 0.8s SSR probe!
@@ -1038,16 +1058,16 @@
           continue;
         }
 
-        // Transient ad-hijack / slow hydration / 422 timeout on a chapter that EXISTS on WTR-Lab -> retry cleanly!
-        if ((parsed.isAdHijacked || parsed.isUnloadedShell || !md) && options?.retryWithCacheBust !== false) {
+        // Any failed parse on a chapter that SSR confirms EXISTS on WTR-Lab -> retry cleanly with fresh cache-bust & relaxed selector!
+        if (options?.retryWithCacheBust !== false) {
           const existsOnWtr = await ensureSsrVerified();
           if (!existsOnWtr) return null;
 
           if (priority === 'high') lastInteractiveJinaAt = Date.now();
           const retryUrl = buildUrl(canonicalSlug, candidateMode, true);
-          // Use 'no-wait' if md was null (avoids 422 if chapter uses non-<p> markup), otherwise 'wide'
-          const retryHeaders = buildBrowserHeaders(!md ? 'no-wait' : 'wide', '16');
-          const retryMd = await fetchJinaWithHeaders(retryUrl, retryHeaders, Math.max(reqTimeoutMs, 21000), priority);
+          // Use 'no-wait' whenever md was null or parsed failed (avoids Jina 422 selector timeout & handles <br>/<div> markup)
+          const retryHeaders = buildBrowserHeaders(!md || !parsed.isAdHijacked ? 'no-wait' : 'wide', '17', true);
+          const retryMd = await fetchJinaWithHeaders(retryUrl, retryHeaders, Math.max(reqTimeoutMs, 22000), priority);
           const retryParsed = parseWtrlabChapterMarkdown({
             md: retryMd || '',
             novelId: cleanId,
@@ -1072,33 +1092,36 @@
         }
       }
 
-      // Final Deep Recovery Pass: if SSR confirmed the chapter genuinely exists on WTR-Lab, do 1 calm backoff recovery
-      // using webplus (no-wait selector, 22s timeout) so NO valid chapter in the middle of a novel is ever dropped!
+      // Final Deep Recovery Pass: if SSR confirmed the chapter genuinely exists on WTR-Lab, try both webplus & web
+      // with full-page no-wait browser rendering (24s timeout) so NO valid chapter in the middle of a novel is ever dropped!
       const stillExists = await ensureSsrVerified();
       if (stillExists && options?.retryWithCacheBust !== false) {
-        await new Promise((r) => setTimeout(r, 1200));
-        const rescueMode: WtrlabServiceMode = chapterNo <= 10 && primaryMode === 'ai' ? 'ai' : 'webplus';
-        const rescueUrl = buildUrl(canonicalSlug, rescueMode, true);
-        const rescueMd = await fetchJinaWithHeaders(rescueUrl, buildBrowserHeaders('no-wait', '17'), 23000, priority);
-        const rescueParsed = parseWtrlabChapterMarkdown({
-          md: rescueMd || '',
-          novelId: cleanId,
-          chapterNo,
-          expectedNovelTitle,
-          activeMode: rescueMode,
-          ssrFallbackTitle: ssrTitleHint,
-        });
-        if (rescueParsed.extracted) {
-          setWtrlabLiveSnapshot(cleanId, chapterNo, rescueMode, rescueParsed.extracted.title, rescueParsed.extracted.paragraphs);
-          if (serviceMode !== rescueMode) {
-            setWtrlabLiveSnapshot(cleanId, chapterNo, serviceMode, rescueParsed.extracted.title, rescueParsed.extracted.paragraphs);
+        const rescueModes: WtrlabServiceMode[] =
+          chapterNo <= 10 && primaryMode === 'ai' ? ['ai', 'webplus', 'web'] : ['webplus', 'web'];
+        for (const rescueMode of rescueModes) {
+          await new Promise((r) => setTimeout(r, 1400));
+          const rescueUrl = buildUrl(canonicalSlug, rescueMode, true);
+          const rescueMd = await fetchJinaWithHeaders(rescueUrl, buildBrowserHeaders('fullpage-no-wait', '19', true), 25000, priority);
+          const rescueParsed = parseWtrlabChapterMarkdown({
+            md: rescueMd || '',
+            novelId: cleanId,
+            chapterNo,
+            expectedNovelTitle,
+            activeMode: rescueMode,
+            ssrFallbackTitle: ssrTitleHint,
+          });
+          if (rescueParsed.extracted) {
+            setWtrlabLiveSnapshot(cleanId, chapterNo, rescueMode, rescueParsed.extracted.title, rescueParsed.extracted.paragraphs);
+            if (serviceMode !== rescueMode) {
+              setWtrlabLiveSnapshot(cleanId, chapterNo, serviceMode, rescueParsed.extracted.title, rescueParsed.extracted.paragraphs);
+            }
+            return {
+              title: rescueParsed.extracted.title,
+              paragraphs: rescueParsed.extracted.paragraphs,
+              modeUsed: rescueMode,
+              source: 'wtrlab-deep-rescue',
+            };
           }
-          return {
-            title: rescueParsed.extracted.title,
-            paragraphs: rescueParsed.extracted.paragraphs,
-            modeUsed: rescueMode,
-            source: 'wtrlab-deep-rescue',
-          };
         }
       }
 
